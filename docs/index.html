@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Demystifying LLM Inference Optimization on Apple Silicon</title>
+<style>
+:root {
+  --bg: #ffffff; --fg: #1a1a2e; --card-bg: #f8f9fa;
+  --accent: #0066cc; --accent2: #e74c3c; --accent3: #27ae60;
+  --border: #dee2e6; --code-bg: #f1f3f5; --muted: #6c757d;
+}
+html[data-theme="dark"] {
+  --bg: #0d1117; --fg: #c9d1d9; --card-bg: #161b22;
+  --accent: #58a6ff; --accent2: #f85149; --accent3: #3fb950;
+  --border: #30363d; --code-bg: #21262d; --muted: #8b949e;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: var(--bg); color: var(--fg); line-height: 1.6; }
+.container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+
+/* Nav */
+nav { background: var(--card-bg); border-bottom: 1px solid var(--border);
+  padding: 12px 0; position: sticky; top: 0; z-index: 100; }
+nav .container { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.nav-brand { font-weight: 700; font-size: 1rem; color: var(--accent); text-decoration: none; }
+.nav-links { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+.nav-links a { color: var(--fg); text-decoration: none; font-size: 0.85rem; }
+.nav-links a:hover { color: var(--accent); }
+.lang-toggle { display: flex; gap: 4px; }
+.lang-toggle button { padding: 4px 10px; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg); color: var(--fg); cursor: pointer; font-size: 0.8rem; }
+.lang-toggle button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.theme-btn { padding: 4px 10px; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg); color: var(--fg); cursor: pointer; font-size: 0.85rem; }
+
+/* Hero */
+.hero { padding: 60px 0 40px; text-align: center; }
+.hero h1 { font-size: 2rem; margin-bottom: 12px; line-height: 1.3; }
+.hero .subtitle { font-size: 1.05rem; color: var(--muted); margin-bottom: 24px; }
+.badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 0.75rem;
+  font-weight: 600; margin: 4px; }
+.badge-hw { background: #e3f2fd; color: #1565c0; }
+.badge-model { background: #fce4ec; color: #c62828; }
+html[data-theme="dark"] .badge-hw { background: #0d2137; color: #58a6ff; }
+html[data-theme="dark"] .badge-model { background: #3d1418; color: #f85149; }
+
+/* Stat cards */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px; margin: 30px 0; }
+.stat-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px;
+  padding: 20px; text-align: center; }
+.stat-card .number { font-size: 2rem; font-weight: 800; color: var(--accent); }
+.stat-card .label { font-size: 0.85rem; color: var(--muted); margin-top: 4px; }
+
+/* Sections */
+section { padding: 40px 0; border-top: 1px solid var(--border); }
+section h2 { font-size: 1.5rem; margin-bottom: 20px; }
+section h3 { font-size: 1.15rem; margin: 20px 0 10px; }
+
+/* Finding cards */
+.findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.finding { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px;
+  padding: 20px; }
+.finding .icon { font-size: 1.5rem; margin-bottom: 8px; }
+.finding h4 { margin-bottom: 8px; }
+.finding p { font-size: 0.9rem; color: var(--muted); }
+
+/* Tables */
+table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 0.9rem; }
+th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+th { background: var(--card-bg); font-weight: 600; }
+tr:hover { background: var(--card-bg); }
+.highlight-bad { color: var(--accent2); font-weight: 600; }
+.highlight-good { color: var(--accent3); font-weight: 600; }
+
+/* Correction table */
+.correction { background: #fff3cd; border-left: 4px solid #ffc107; padding: 12px 16px;
+  border-radius: 0 8px 8px 0; margin: 12px 0; font-size: 0.9rem; }
+html[data-theme="dark"] .correction { background: #332b00; border-color: #ffc107; }
+.correction strong { color: var(--accent2); }
+
+/* Roadmap */
+.roadmap-tier { margin: 16px 0; padding: 16px; background: var(--card-bg);
+  border-radius: 10px; border: 1px solid var(--border); }
+.roadmap-tier h4 { margin-bottom: 8px; }
+.tier-tag { display: inline-block; padding: 2px 8px; border-radius: 4px;
+  font-size: 0.75rem; font-weight: 600; margin-right: 8px; }
+.tier-now { background: #d4edda; color: #155724; }
+.tier-short { background: #cce5ff; color: #004085; }
+.tier-mid { background: #fff3cd; color: #856404; }
+.tier-no { background: #f8d7da; color: #721c24; }
+html[data-theme="dark"] .tier-now { background: #0d3321; color: #3fb950; }
+html[data-theme="dark"] .tier-short { background: #0d2137; color: #58a6ff; }
+html[data-theme="dark"] .tier-mid { background: #332b00; color: #d29922; }
+html[data-theme="dark"] .tier-no { background: #3d1418; color: #f85149; }
+
+/* Footer */
+footer { padding: 30px 0; border-top: 1px solid var(--border); text-align: center;
+  font-size: 0.85rem; color: var(--muted); }
+footer a { color: var(--accent); }
+
+/* Lang toggle */
+html[lang="en"] .z { display: none; }
+html[lang="zh"] .e { display: none; }
+</style>
+</head>
+<body>
+
+<!-- Nav -->
+<nav>
+<div class="container">
+  <a href="#" class="nav-brand">MLX Optimization Study</a>
+  <div class="nav-links">
+    <a href="#findings" class="e">Key Findings</a><a href="#findings" class="z">核心发现</a>
+    <a href="#results" class="e">Results</a><a href="#results" class="z">实验结果</a>
+    <a href="#corrections" class="e">Corrections</a><a href="#corrections" class="z">误解纠正</a>
+    <a href="#roadmap" class="e">Roadmap</a><a href="#roadmap" class="z">路线图</a>
+    <a href="paper.pdf" class="e">PDF Paper</a><a href="paper.pdf" class="z">论文PDF</a>
+    <div class="lang-toggle">
+      <button id="btn-en" class="active" onclick="setLang('en')">EN</button>
+      <button id="btn-zh" onclick="setLang('zh')">中文</button>
+    </div>
+    <button class="theme-btn" onclick="toggleTheme()" title="Toggle theme">
+      <span id="theme-icon">&#9790;</span>
+    </button>
+  </div>
+</div>
+</nav>
+
+<!-- Hero -->
+<div class="hero">
+<div class="container">
+  <h1>
+    <span class="e">Demystifying LLM Inference Optimization on Apple Silicon</span>
+    <span class="z">Apple Silicon 大模型推理优化：误解与真相</span>
+  </h1>
+  <p class="subtitle">
+    <span class="e">Why Speculative Decoding Fails and Where the Real Bottlenecks Lie</span>
+    <span class="z">为什么投机解码失败，以及真正的瓶颈在哪里</span>
+  </p>
+  <div>
+    <span class="badge badge-hw">Apple M2 Ultra &middot; 76 GPU Cores &middot; 192GB</span>
+    <span class="badge badge-model">Qwen3.5-9B &middot; Qwen3-8B</span>
+  </div>
+  <!-- Stats -->
+  <div class="stats">
+    <div class="stat-card">
+      <div class="number">85%</div>
+      <div class="label"><span class="e">MLX Bandwidth Utilization</span><span class="z">MLX 带宽利用率</span></div>
+    </div>
+    <div class="stat-card">
+      <div class="number" style="color:var(--accent2)">0.85-1.00x</div>
+      <div class="label"><span class="e">Speculative Decoding Speedup</span><span class="z">投机解码加速比</span></div>
+    </div>
+    <div class="stat-card">
+      <div class="number">57.6%</div>
+      <div class="label"><span class="e">Prefill Time in GEMM</span><span class="z">Prefill 中 GEMM 占比</span></div>
+    </div>
+    <div class="stat-card">
+      <div class="number" style="color:var(--accent3)">5/9</div>
+      <div class="label"><span class="e">Prior Assumptions Corrected</span><span class="z">纠正的错误假设数</span></div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- Findings -->
+<section id="findings">
+<div class="container">
+  <h2><span class="e">Key Findings</span><span class="z">核心发现</span></h2>
+  <div class="findings">
+    <div class="finding">
+      <div class="icon">&#9889;</div>
+      <h4><span class="e">Memory Bandwidth is the Wall</span><span class="z">内存带宽是天花板</span></h4>
+      <p><span class="e">MLX achieves 85% of M2 Ultra's 800 GB/s bandwidth during decode. Batch forward passes cannot approach theoretical speedup because each query token linearly increases KV cache bandwidth demand.</span>
+      <span class="z">MLX decode 已达 M2 Ultra 800 GB/s 带宽的 85%。Batch 前向传播无法接近理论加速比，因为每个额外 query token 会线性增加 KV cache 带宽需求。</span></p>
+    </div>
+    <div class="finding">
+      <div class="icon">&#10060;</div>
+      <h4><span class="e">Speculative Decoding Doesn't Help</span><span class="z">投机解码无法加速</span></h4>
+      <p><span class="e">N-gram speculative decoding yields 0.85-1.00x on both pure Transformer and hybrid architectures. The pure Transformer (1.79x batch speedup) is actually worse than the hybrid (2.57x).</span>
+      <span class="z">N-gram 投机解码在纯 Transformer 和混合架构上均为 0.85-1.00x。纯 Transformer 的 batch 加速比 (1.79x) 反而低于混合架构 (2.57x)。</span></p>
+    </div>
+    <div class="finding">
+      <div class="icon">&#128270;</div>
+      <h4><span class="e">Prefill Bottleneck is GEMM, Not Attention</span><span class="z">Prefill 瓶颈是 GEMM 不是 Attention</span></h4>
+      <p><span class="e">Quantized matrix multiplication in linear projections accounts for 57.6% of prefill time. SDPA attention is only 6.7%. Optimizing attention kernels alone cannot close the gap with llama.cpp.</span>
+      <span class="z">量化矩阵乘法占 prefill 时间的 57.6%，SDPA attention 仅占 6.7%。单独优化 attention kernel 无法弥合与 llama.cpp 的差距。</span></p>
+    </div>
+    <div class="finding">
+      <div class="icon">&#9989;</div>
+      <h4><span class="e">MLX is More Mature Than Expected</span><span class="z">MLX 比预期更成熟</span></h4>
+      <p><span class="e">AOT shader compilation, single-dispatch attention, and SIMD matrix multiply are already implemented. Five "missing features" from the prior proposal actually exist.</span>
+      <span class="z">AOT 预编译、单次 dispatch attention、SIMD 矩阵乘法都已实现。原方案中 5 个"缺失特性"实际已存在。</span></p>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- Results -->
+<section id="results">
+<div class="container">
+  <h2><span class="e">Benchmark Results</span><span class="z">实验结果</span></h2>
+
+  <h3><span class="e">MLX vs llama.cpp Baseline</span><span class="z">MLX vs llama.cpp 基准对比</span></h3>
+  <table>
+    <tr><th><span class="e">Metric</span><span class="z">指标</span></th><th>llama.cpp</th><th>MLX</th><th><span class="e">Gap</span><span class="z">差距</span></th></tr>
+    <tr><td>Prefill (512 tok)</td><td>1,167 t/s</td><td>627 t/s</td><td class="highlight-bad">llama.cpp 1.86x</td></tr>
+    <tr><td>Token Generation</td><td>42.4 t/s</td><td>65.0 t/s</td><td class="highlight-good">MLX 1.53x</td></tr>
+    <tr><td><span class="e">Bandwidth Utilization</span><span class="z">带宽利用率</span></td><td>63%</td><td>85%</td><td class="highlight-good">MLX +22%</td></tr>
+    <tr><td><span class="e">Peak Memory</span><span class="z">峰值内存</span></td><td>12.07 GiB</td><td>10.55 GB</td><td class="highlight-good">MLX 1.14x</td></tr>
+  </table>
+
+  <h3><span class="e">Batch Forward Speedup (The Critical Test)</span><span class="z">Batch 前向加速比（关键测试）</span></h3>
+  <table>
+    <tr><th>Batch</th><th colspan="2">Qwen3.5-9B-8bit (<span class="e">Hybrid</span><span class="z">混合</span>)</th><th colspan="2">Qwen3-8B-4bit (<span class="e">Pure Transformer</span><span class="z">纯 Transformer</span>)</th><th><span class="e">Theoretical</span><span class="z">理论值</span></th></tr>
+    <tr><th></th><th><span class="e">Time</span><span class="z">耗时</span></th><th><span class="e">Speedup</span><span class="z">加速比</span></th><th><span class="e">Time</span><span class="z">耗时</span></th><th><span class="e">Speedup</span><span class="z">加速比</span></th><th></th></tr>
+    <tr><td>1</td><td>17.08ms</td><td>1.00x</td><td>9.96ms</td><td>1.00x</td><td>1.00x</td></tr>
+    <tr><td>2</td><td>19.40ms</td><td>1.76x</td><td>14.32ms</td><td>1.39x</td><td>2.00x</td></tr>
+    <tr><td>5</td><td>33.28ms</td><td class="highlight-bad">2.57x</td><td>27.87ms</td><td class="highlight-bad">1.79x</td><td>5.00x</td></tr>
+    <tr><td>8</td><td>42.71ms</td><td class="highlight-bad">3.20x</td><td>41.31ms</td><td class="highlight-bad">1.93x</td><td>8.00x</td></tr>
+  </table>
+
+  <h3><span class="e">Speculative Decoding Results</span><span class="z">投机解码结果</span></h3>
+  <table>
+    <tr><th><span class="e">Model</span><span class="z">模型</span></th><th>Prompt</th><th><span class="e">Std (t/s)</span><span class="z">标准 (t/s)</span></th><th><span class="e">Spec (t/s)</span><span class="z">投机 (t/s)</span></th><th>Speedup</th><th>Accept%</th></tr>
+    <tr><td rowspan="4">Qwen3.5-9B</td><td>short</td><td>67.9</td><td>67.8</td><td>1.00x</td><td>0%</td></tr>
+    <tr><td>medium</td><td>65.3</td><td>64.9</td><td>0.99x</td><td>0%</td></tr>
+    <tr><td>long</td><td>65.0</td><td>64.6</td><td>0.99x</td><td>50%</td></tr>
+    <tr><td>summary</td><td>64.5</td><td>61.0</td><td class="highlight-bad">0.95x</td><td>52%</td></tr>
+    <tr><td rowspan="4">Qwen3-8B</td><td>short</td><td>114.3</td><td>110.4</td><td>0.97x</td><td>0%</td></tr>
+    <tr><td>medium</td><td>114.1</td><td>104.1</td><td class="highlight-bad">0.91x</td><td>30%</td></tr>
+    <tr><td>long</td><td>112.8</td><td>102.4</td><td class="highlight-bad">0.91x</td><td>30%</td></tr>
+    <tr><td>summary</td><td>110.0</td><td>93.0</td><td class="highlight-bad">0.85x</td><td>55%</td></tr>
+  </table>
+
+  <h3><span class="e">Prefill Time Decomposition (Qwen3.5, 512 tok)</span><span class="z">Prefill 时间分解 (Qwen3.5, 512 tok)</span></h3>
+  <table>
+    <tr><th><span class="e">Component</span><span class="z">组件</span></th><th><span class="e">Time (ms)</span><span class="z">耗时 (ms)</span></th><th><span class="e">% of Total</span><span class="z">占比</span></th></tr>
+    <tr><td><span class="e">Linear Projections (quantized GEMM)</span><span class="z">线性投影 (量化 GEMM)</span></td><td>~430</td><td class="highlight-bad">57.6%</td></tr>
+    <tr><td><span class="e">GatedDeltaNet Recurrence</span><span class="z">GatedDeltaNet 递推</span></td><td>~216</td><td>29.0%</td></tr>
+    <tr><td><span class="e">SDPA Attention (8 layers)</span><span class="z">SDPA 注意力 (8 层)</span></td><td>~50</td><td>6.7%</td></tr>
+    <tr><td><span class="e">Other (embedding, norms, etc.)</span><span class="z">其他 (embedding, norms 等)</span></td><td>~50</td><td>6.7%</td></tr>
+  </table>
+</div>
+</section>
+
+<!-- Corrections -->
+<section id="corrections">
+<div class="container">
+  <h2><span class="e">Corrected Misconceptions</span><span class="z">误解纠正</span></h2>
+
+  <div class="correction">
+    <strong>#1</strong>
+    <span class="e">"MLX uses 256+ kernel dispatches" &rarr; MLX uses a single <code>dispatch_threadgroups</code> call, identical to llama.cpp.</span>
+    <span class="z">"MLX 使用 256+ 次 dispatch" &rarr; MLX 使用 1 次 <code>dispatch_threadgroups</code> 调用，与 llama.cpp 完全相同。</span>
+  </div>
+  <div class="correction">
+    <strong>#2</strong>
+    <span class="e">"Metal shaders are JIT-compiled" &rarr; MLX defaults to AOT compilation (<code>mlx.metallib</code>). JIT is an optional dev mode.</span>
+    <span class="z">"Metal shader 是 JIT 编译的" &rarr; MLX 默认使用 AOT 预编译 (<code>mlx.metallib</code>)，JIT 是可选的开发模式。</span>
+  </div>
+  <div class="correction">
+    <strong>#3</strong>
+    <span class="e">"SIMD matrix multiply is not utilized" &rarr; MLX's <code>steel_attention</code> and <code>steel/gemm</code> already use <code>simdgroup_multiply_accumulate</code>.</span>
+    <span class="z">"SIMD 矩阵乘法未被利用" &rarr; MLX 的 <code>steel_attention</code> 和 <code>steel/gemm</code> 已经使用 <code>simdgroup_multiply_accumulate</code>。</span>
+  </div>
+  <div class="correction">
+    <strong>#4</strong>
+    <span class="e">"Pure Transformer batch(5) should approach 5x" &rarr; Actual speedup is only <strong>1.79x</strong> due to memory bandwidth saturation.</span>
+    <span class="z">"纯 Transformer batch(5) 应接近 5x" &rarr; 实际加速比仅 <strong>1.79x</strong>，因为内存带宽已饱和。</span>
+  </div>
+  <div class="correction">
+    <strong>#5</strong>
+    <span class="e">"Speculative decoding should yield 1.5-2x" &rarr; N-gram speculative decoding yields <strong>0.85-1.00x</strong> (no improvement).</span>
+    <span class="z">"投机解码预计 +1.5-2x" &rarr; N-gram 投机解码实际为 <strong>0.85-1.00x</strong>（无改善）。</span>
+  </div>
+</div>
+</section>
+
+<!-- Roadmap -->
+<section id="roadmap">
+<div class="container">
+  <h2><span class="e">Revised Optimization Roadmap</span><span class="z">修订后的优化路线图</span></h2>
+
+  <div class="roadmap-tier">
+    <h4><span class="tier-tag tier-now"><span class="e">Immediate</span><span class="z">立即可做</span></span>
+    <span class="e">&lt; 5 lines of code</span><span class="z">改动 &lt; 5 行代码</span></h4>
+    <table>
+      <tr><th><span class="e">Optimization</span><span class="z">优化项</span></th><th><span class="e">Change</span><span class="z">改动</span></th><th><span class="e">Expected Gain</span><span class="z">预期收益</span></th></tr>
+      <tr><td><span class="e">KV Cache quantization threshold</span><span class="z">KV Cache 量化阈值</span></td><td>5000 &rarr; 512</td><td class="highlight-good"><span class="e">Memory -28%</span><span class="z">内存 -28%</span></td></tr>
+      <tr><td><span class="e">Prefill chunk size</span><span class="z">Prefill 分块大小</span></td><td>2048 &rarr; 4096</td><td class="highlight-good">Prefill +5-10%</td></tr>
+    </table>
+  </div>
+
+  <div class="roadmap-tier">
+    <h4><span class="tier-tag tier-short"><span class="e">Short-term</span><span class="z">短期</span></span> 1-2 <span class="e">weeks</span><span class="z">周</span></h4>
+    <table>
+      <tr><th><span class="e">Optimization</span><span class="z">优化项</span></th><th><span class="e">Expected Gain</span><span class="z">预期收益</span></th></tr>
+      <tr><td><span class="e">Fused QKV Projections</span><span class="z">融合 QKV 投影</span></td><td class="highlight-good">Prefill +15-25%</td></tr>
+      <tr><td><span class="e">Block mask skipping in SDPA</span><span class="z">SDPA 中的块掩码跳过</span></td><td class="highlight-good">Prefill +5-10%</td></tr>
+    </table>
+  </div>
+
+  <div class="roadmap-tier">
+    <h4><span class="tier-tag tier-mid"><span class="e">Medium-term</span><span class="z">中期</span></span> 2-4 <span class="e">weeks</span><span class="z">周</span></h4>
+    <table>
+      <tr><th><span class="e">Optimization</span><span class="z">优化项</span></th><th><span class="e">Expected Gain</span><span class="z">预期收益</span></th></tr>
+      <tr><td><span class="e">Chunkwise Parallel GatedDeltaNet Prefill (WY decomposition)</span><span class="z">Chunkwise 并行 GatedDeltaNet Prefill (WY 分解)</span></td><td class="highlight-good">Prefill 3-10x</td></tr>
+    </table>
+  </div>
+
+  <div class="roadmap-tier">
+    <h4><span class="tier-tag tier-no"><span class="e">Not Recommended</span><span class="z">不推荐</span></span></h4>
+    <table>
+      <tr><th><span class="e">Direction</span><span class="z">方向</span></th><th><span class="e">Reason</span><span class="z">原因</span></th></tr>
+      <tr><td>N-gram Speculative Decoding</td><td><span class="e">Batch speedup insufficient (1.79-2.57x vs 5x)</span><span class="z">Batch 加速比不足 (1.79-2.57x vs 5x)</span></td></tr>
+      <tr><td><span class="e">Unified Attention Kernel</span><span class="z">统一 Attention Kernel</span></td><td><span class="e">MLX already uses single dispatch</span><span class="z">MLX 已是单次 dispatch</span></td></tr>
+      <tr><td>Metal Shader <span class="e">Precompilation</span><span class="z">预编译</span></td><td><span class="e">Already AOT; cold start only</span><span class="z">已 AOT 预编译；仅影响冷启动</span></td></tr>
+      <tr><td>SIMD Matrix Multiply</td><td><span class="e">Already used in steel_attention & steel/gemm</span><span class="z">steel_attention 和 steel/gemm 中已使用</span></td></tr>
+      <tr><td>Continuous Batching</td><td><span class="e">No benefit for single-user edge</span><span class="z">单用户端侧无收益</span></td></tr>
+      <tr><td>Paged Attention</td><td><span class="e">No memory fragmentation issue</span><span class="z">无内存碎片问题</span></td></tr>
+      <tr><td><span class="e">GDN Decode Parallelization</span><span class="z">GDN Decode 并行化</span></td><td><span class="e">Mathematically infeasible</span><span class="z">数学上不可行</span></td></tr>
+    </table>
+  </div>
+</div>
+</section>
+
+<!-- Footer -->
+<footer>
+<div class="container">
+  <p>
+    <span class="e">March 2026 &middot; Apple M2 Ultra &middot; MLX 0.31.0</span>
+    <span class="z">2026年3月 &middot; Apple M2 Ultra &middot; MLX 0.31.0</span>
+  </p>
+  <p><a href="paper.pdf"><span class="e">Download Paper (PDF)</span><span class="z">下载论文 (PDF)</span></a></p>
+</div>
+</footer>
+
+<script>
+function setLang(lang) {
+  document.documentElement.lang = lang;
+  document.getElementById('btn-en').classList.toggle('active', lang === 'en');
+  document.getElementById('btn-zh').classList.toggle('active', lang === 'zh');
+  localStorage.setItem('lang', lang);
+}
+function toggleTheme() {
+  const html = document.documentElement;
+  const isDark = html.getAttribute('data-theme') === 'dark';
+  html.setAttribute('data-theme', isDark ? 'light' : 'dark');
+  document.getElementById('theme-icon').innerHTML = isDark ? '&#9790;' : '&#9728;';
+  localStorage.setItem('theme', isDark ? 'light' : 'dark');
+}
+// Restore preferences
+(function() {
+  const lang = localStorage.getItem('lang') || 'en';
+  const theme = localStorage.getItem('theme') || 'light';
+  setLang(lang);
+  if (theme === 'dark') toggleTheme();
+})();
+</script>
+</body>
+</html>

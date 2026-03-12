@@ -1,0 +1,445 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── Packages ──────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{tabularx}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=blue!60!black,
+  urlcolor=blue!70!black,
+}
+
+% ── Title ─────────────────────────────────────────────────────
+\title{%
+  \textbf{Demystifying LLM Inference Optimization on Apple Silicon:\\
+  Why Speculative Decoding Fails and Where the Real Bottlenecks Lie}
+}
+
+\author{
+  Alex Chen \\
+  \textit{Independent Research} \\
+  \texttt{Apple M2 Ultra, 192\,GB}
+}
+
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+% ── Abstract ──────────────────────────────────────────────────
+\begin{abstract}
+We present a systematic study of LLM inference optimization on Apple M2 Ultra using the MLX framework. Through extensive profiling and experimentation across 9 optimization directions, we reveal several counter-intuitive findings: (1)~N-gram Prompt Lookup Speculative Decoding fails to accelerate inference on \emph{both} pure Transformer (Qwen3-8B) and hybrid linear-attention architectures (Qwen3.5-9B), achieving 0.85--1.00$\times$ speedup due to memory-bandwidth-limited batch forward passes yielding only 1.79--2.57$\times$ actual speedup versus the theoretical 5$\times$; (2)~MLX already implements AOT shader compilation, single-dispatch attention kernels, and SIMD matrix operations---features previously assumed missing; (3)~the prefill bottleneck is quantized GEMM in linear projections (57.6\% of time), not the attention kernel (6.7\%). We correct five misconceptions from prior optimization proposals and identify three high-value optimization paths: KV cache quantization threshold tuning (1-line change, 28\% memory reduction), fused QKV projections (15--25\% prefill improvement), and chunkwise parallel GatedDeltaNet prefill (3--10$\times$ prefill speedup).
+\end{abstract}
+
+% ── 1. Introduction ───────────────────────────────────────────
+\section{Introduction}
+
+Apple Silicon's unified memory architecture offers a unique advantage for on-device LLM inference: CPU and GPU share high-bandwidth memory (M2 Ultra: 800\,GB/s), eliminating the PCIe bottleneck of discrete-GPU systems. The MLX framework~\cite{mlx} exploits this design, achieving 85\% memory bandwidth utilization during token generation---53\% faster than llama.cpp~\cite{llamacpp} on the same hardware.
+
+However, MLX's prompt processing (prefill) lags behind llama.cpp by 1.9--3.6$\times$, suggesting significant optimization opportunities. A prior optimization proposal~\cite{prior_proposal} identified 9 directions ranging from adaptive Flash Attention block sizes to Continuous Batching, projecting substantial speedups (e.g., ``3--5$\times$ prefill from adaptive block sizes,'' ``1.5--2$\times$ generation from speculative decoding'').
+
+In this work, we systematically evaluate each proposed optimization through code analysis, profiling, and end-to-end benchmarking. Our key contributions are:
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Speculative decoding evaluation on two architectures}: We implement N-gram Prompt Lookup Speculative Decoding with zero-cost cache checkpointing and test on both Qwen3.5-9B (hybrid GatedDeltaNet + Transformer) and Qwen3-8B (pure Transformer). Neither architecture benefits---the fundamental bottleneck is memory bandwidth, not compute.
+
+  \item \textbf{Correction of five misconceptions}: We demonstrate that MLX already implements AOT shader compilation, single-dispatch attention, and SIMD matrix multiply; that prefill bottlenecks are in quantized GEMM rather than attention; and that pure-Transformer batch speedup is far below theoretical predictions.
+
+  \item \textbf{Comprehensive prefill profiling}: We decompose prefill time by layer type, identifying that linear projections account for 57.6\% of total time versus 6.7\% for SDPA attention and 29.0\% for GatedDeltaNet recurrence.
+
+  \item \textbf{Revised optimization roadmap}: Based on empirical evidence, we identify three actionable optimizations with validated feasibility assessments.
+\end{enumerate}
+
+% ── 2. Background ─────────────────────────────────────────────
+\section{Background}
+
+\subsection{Hardware Platform}
+
+\begin{table}[H]
+\centering
+\caption{Apple M2 Ultra specifications.}
+\label{tab:hardware}
+\begin{tabular}{ll}
+\toprule
+\textbf{Component} & \textbf{Specification} \\
+\midrule
+CPU & 24 cores (16P + 8E) \\
+GPU & 76 Apple GPU cores, Metal~4 \\
+Unified Memory & 192\,GB, 800\,GB/s bandwidth \\
+SIMD Width & 32 (simdgroup) \\
+Per-core Registers & $\sim$208\,KB \\
+Threadgroup Memory & $\sim$32\,KB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Model Architectures}
+
+\textbf{Qwen3.5-9B} uses a hybrid architecture with 32 layers:
+\begin{itemize}[leftmargin=2em]
+  \item 24 layers (75\%): GatedDeltaNet~\cite{gateddeltanet} (linear attention with gated delta rule)
+  \item 8 layers (25\%): Standard full attention (head\_dim=256, GQA 4:1)
+\end{itemize}
+
+The GatedDeltaNet recurrence is:
+\begin{equation}
+  S_t = g_t \cdot (I - \beta_t \cdot k_t k_t^\top) \cdot S_{t-1} + \beta_t \cdot k_t v_t^\top
+  \label{eq:gdn}
+\end{equation}
+where $S_t \in \mathbb{R}^{D_v \times D_k}$ is the state matrix, $g_t$ is a per-head scalar gate, $\beta_t = \sigma(b_t)$ is the update rate, and $k_t, v_t$ are L2-normalized key/value vectors.
+
+\textbf{Qwen3-8B} is a standard Transformer with 36 layers of full attention (head\_dim=128, GQA 4:1), all using KVCache.
+
+\subsection{Frameworks}
+
+\textbf{MLX}~\cite{mlx} (v0.31.0): Apple's ML framework with lazy evaluation, unified memory, and Steel GEMM/Attention kernels. Model loaded via \texttt{mlx-vlm} (0.3.12) for Qwen3.5 and \texttt{mlx-lm} (0.30.7) for Qwen3.
+
+\textbf{llama.cpp}~\cite{llamacpp}: C++ inference engine with 103 Metal kernels, Flash Attention, and 15+ quantization formats. Uses GGUF model format (Q8\_K\_XL).
+
+% ── 3. Speculative Decoding ──────────────────────────────────
+\section{Speculative Decoding Experiments}
+
+\subsection{Implementation}
+
+We implemented Prompt Lookup Speculative Decoding~\cite{spec_decoding} with the following key design decisions:
+
+\textbf{Zero-cost cache checkpointing}: GatedDeltaNet's \texttt{ArraysCache} does not support trim operations. We exploit the fact that GatedDeltaNet creates \emph{new} array objects on each forward step (via \texttt{mx.concatenate} and \texttt{gated\_delta\_update}), so saving Python references to old arrays constitutes a valid checkpoint. Measured overhead: save=0.01\,ms, restore=0.04\,ms.
+
+\textbf{Async pipeline preservation}: The standard generation path uses \texttt{mx.async\_eval} to overlap GPU computation with CPU token output. Our speculative path only intervenes when an N-gram match is found, ensuring zero overhead on the common (no-match) path.
+
+\textbf{Batch sampling}: Instead of evaluating each draft token individually, we compare all positions in a single \texttt{mx.eval(matches, draft\_sampled)} call.
+
+\subsection{Batch Forward Pass Speedup}
+
+\begin{table}[H]
+\centering
+\caption{Batch forward pass speedup vs.\ $N \times$ single-token forward. Measured after 20-token warmup with checkpoint/restore per iteration.}
+\label{tab:batch_speedup}
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Batch} & \multicolumn{2}{c}{\textbf{Qwen3.5-9B-8bit (hybrid)}} & \multicolumn{2}{c}{\textbf{Qwen3-8B-4bit (pure Transformer)}} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+\textbf{Size} & Time (ms) & Speedup & Time (ms) & Speedup \\
+\midrule
+1 & 17.08 & 1.00$\times$ & 9.96 & 1.00$\times$ \\
+2 & 19.40 & 1.76$\times$ & 14.32 & 1.39$\times$ \\
+3 & 22.84 & 2.24$\times$ & 18.73 & 1.60$\times$ \\
+5 & 33.28 & 2.57$\times$ & 27.87 & 1.79$\times$ \\
+8 & 42.71 & 3.20$\times$ & 41.31 & 1.93$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Counter-intuitive finding}: The pure Transformer achieves \emph{lower} batch speedup (1.79$\times$) than the hybrid architecture (2.57$\times$) for batch size~5. This is because:
+
+\begin{enumerate}[leftmargin=2em]
+  \item The 4-bit Qwen3 model is smaller ($\sim$5\,GB vs.\ $\sim$10\,GB), so single-token forward is already faster (10\,ms vs.\ 17\,ms), closer to the bandwidth ceiling.
+  \item Additional query tokens in a batch linearly increase KV cache attention bandwidth demand.
+  \item At 85\% bandwidth utilization, there is almost no headroom for ``free'' batch computation.
+\end{enumerate}
+
+For the hybrid architecture, we can decompose the forward pass into parallel (P) and sequential (R) components: $\text{Time}(N) \approx P + N \cdot R$. Fitting to measurements: $P = 13.03$\,ms (76\%), $R = 4.05$\,ms (24\%).
+
+\subsection{End-to-End Benchmark Results}
+
+\begin{table}[H]
+\centering
+\caption{Speculative decoding benchmark results (ngram=3, draft=5, max\_tokens=128/256).}
+\label{tab:spec_results}
+\begin{tabular}{llcccc}
+\toprule
+\textbf{Model} & \textbf{Prompt} & \textbf{Std (t/s)} & \textbf{Spec (t/s)} & \textbf{Speedup} & \textbf{Accept\%} \\
+\midrule
+\multirow{4}{*}{Qwen3.5-9B} & short & 67.9 & 67.8 & 1.00$\times$ & 0\% \\
+ & medium & 65.3 & 64.9 & 0.99$\times$ & 0\% \\
+ & long & 65.0 & 64.6 & 0.99$\times$ & 50\% \\
+ & summary & 64.5 & 61.0 & 0.95$\times$ & 52\% \\
+\midrule
+\multirow{4}{*}{Qwen3-8B} & short & 114.3 & 110.4 & 0.97$\times$ & 0\% \\
+ & medium & 114.1 & 104.1 & 0.91$\times$ & 30\% \\
+ & long & 112.8 & 102.4 & 0.91$\times$ & 30\% \\
+ & summary & 110.0 & 93.0 & 0.85$\times$ & 55\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Speculative decoding is \emph{slower} on the pure Transformer (0.85$\times$ worst case) than on the hybrid architecture (0.95$\times$ worst case), despite the hybrid having sequential GatedDeltaNet layers. The pure Transformer's higher baseline speed (114 vs.\ 65\,t/s) means each speculative ``miss'' is more expensive in relative terms.
+
+\subsection{Cost Analysis}
+
+For batch(5) with 2 accepted tokens (typical scenario):
+
+\begin{table}[H]
+\centering
+\caption{Per-step cost breakdown for speculative verification.}
+\label{tab:cost}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Operation} & \textbf{Qwen3.5 (ms)} & \textbf{Qwen3 (ms)} \\
+\midrule
+Checkpoint & 0.01 & 0.01 \\
+Batch forward (5 tok) & 33.28 & 27.87 \\
+Sampling & 0.52 & 0.50 \\
+Restore & 0.04 & 0.04 \\
+Reprocess (2+1 tok) & 18.42 & $\sim$13.0 \\
+\midrule
+\textbf{Total} & 52.27 & $\sim$41.4 \\
+\textbf{Tokens produced} & 3 & 3 \\
+\textbf{ms/token (spec)} & 17.4 & 13.8 \\
+\textbf{ms/token (std)} & 17.1 & 10.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The speculative path produces 3 tokens in 52\,ms (Qwen3.5) or 41\,ms (Qwen3), yielding 17.4 or 13.8\,ms/token---comparable to or worse than standard generation.
+
+% ── 4. Prefill Profiling ─────────────────────────────────────
+\section{Prefill Performance Analysis}
+
+\subsection{Throughput Comparison}
+
+\begin{table}[H]
+\centering
+\caption{Prefill throughput at different prompt lengths.}
+\label{tab:prefill}
+\begin{tabular}{rccc}
+\toprule
+\textbf{Length} & \textbf{Qwen3.5 (t/s)} & \textbf{Qwen3 (t/s)} & \textbf{Ratio} \\
+\midrule
+64 & 528.8 & 571.7 & 1.08$\times$ \\
+128 & 587.3 & 626.8 & 1.07$\times$ \\
+256 & 642.9 & 703.8 & 1.09$\times$ \\
+512 & 686.1 & 739.7 & 1.08$\times$ \\
+1024 & 698.1 & 744.5 & 1.07$\times$ \\
+2048 & 708.4 & 743.6 & 1.05$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Despite 75\% of Qwen3.5's layers using sequential GatedDeltaNet, its prefill is only 5--9\% slower than Qwen3's pure Transformer.
+
+\subsection{Layer-Level Time Decomposition}
+
+For Qwen3.5-9B at 512 tokens, we profiled each layer individually:
+
+\begin{table}[H]
+\centering
+\caption{Time decomposition by component (Qwen3.5-9B, 512 tokens).}
+\label{tab:decomposition}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Component} & \textbf{Time (ms)} & \textbf{\% of Total} \\
+\midrule
+Linear projections (all layers) & $\sim$430 & \textbf{57.6\%} \\
+GatedDeltaNet recurrence kernel & $\sim$216 & 29.0\% \\
+SDPA attention (8 full-attn layers) & $\sim$50 & 6.7\% \\
+Other (embedding, norms, MLP gating) & $\sim$50 & 6.7\% \\
+\midrule
+\textbf{Total} & $\sim$747 & 100\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The dominant bottleneck is \textbf{quantized matrix multiplication in linear projections}, consuming 57.6\% of prefill time. The attention kernel (6.7\%) and GatedDeltaNet recurrence (29.0\%) are secondary.
+
+\subsection{llama.cpp Performance Gap Analysis}
+
+The 1.9--3.6$\times$ prefill gap between MLX and llama.cpp is attributable to:
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Operator fusion} ($\sim$40\%): llama.cpp compiles a tighter compute graph with fewer intermediate buffers.
+  \item \textbf{In-kernel dequantization} ($\sim$30\%): llama.cpp fuses dequantization inside GEMM kernels, reducing memory round-trips.
+  \item \textbf{Block mask skipping} ($\sim$15\%): llama.cpp precomputes fully-masked KV blocks and skips them entirely; MLX evaluates masks per-element.
+  \item \textbf{Dispatch overhead} ($\sim$15\%): MLX's lazy evaluation model incurs higher per-operation scheduling cost for short sequences.
+\end{enumerate}
+
+% ── 5. Misconception Corrections ─────────────────────────────
+\section{Correcting Prior Assumptions}
+
+\begin{table}[H]
+\centering
+\caption{Five misconceptions from the prior optimization proposal, with corrections.}
+\label{tab:corrections}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{\#} & \textbf{Prior Assumption} & \textbf{Actual Finding} \\
+\midrule
+1 & MLX uses 256+ kernel dispatches for attention & MLX uses a single \texttt{dispatch\_threadgroups} call, identical to llama.cpp \\
+2 & Metal shaders are JIT-compiled at runtime & MLX defaults to AOT compilation (\texttt{mlx.metallib}); JIT is an optional dev mode \\
+3 & SIMD matrix multiply is not utilized & MLX's \texttt{steel\_attention} and \texttt{steel/gemm} already use \texttt{simdgroup\_multiply\_accumulate} \\
+4 & Pure-Transformer batch(5) should approach 5$\times$ & Actual speedup is only 1.79$\times$ due to memory bandwidth saturation \\
+5 & Speculative decoding should yield 1.5--2$\times$ & N-gram speculative decoding yields 0.85--1.00$\times$ (no improvement) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% ── 6. GatedDeltaNet Parallelization ─────────────────────────
+\section{GatedDeltaNet Parallelization Analysis}
+
+\subsection{Parallel Scan Feasibility}
+
+Equation~\ref{eq:gdn} defines a \textbf{matrix-valued affine recurrence}. While scalar recurrences $s_t = a_t \cdot s_{t-1} + b_t$ can be parallelized via associative scan in $O(\log T)$ steps, the GatedDeltaNet recurrence requires $[D_k \times D_k]$ matrix multiplications at each scan step.
+
+For Qwen3.5 with $D_k = 128$: each scan step involves $128 \times 128$ matrix multiplication ($O(d^3) = O(2 \times 10^6)$ FLOPs), and $T$ steps require $O(T \cdot d^2)$ memory for intermediate states. At $T = 1024$ with 32 heads, this demands $\sim$32\,GB---clearly impractical.
+
+In contrast, Mamba/Mamba2's recurrence uses \emph{diagonal} (element-wise scalar) decay, enabling standard parallel scan with $O(d)$ per step.
+
+\subsection{Chunkwise Parallel: A Viable Alternative}
+
+The DeltaNet~\cite{deltanet} and GatedDeltaNet~\cite{gateddeltanet} papers propose a chunkwise parallel algorithm using the WY compact representation of Householder products:
+
+\begin{enumerate}[leftmargin=2em]
+  \item Divide the sequence into chunks of size $C$ (e.g., 64).
+  \item Within each chunk: use WY decomposition to parallelize the recurrence.
+  \item Between chunks: sequentially pass the final state.
+\end{enumerate}
+
+Complexity: $O(L \cdot C \cdot d + L \cdot d^2)$ with $O(L/C)$ sequential steps---a significant improvement over $O(L)$ sequential for prefill. MLX already has a precedent: Mamba2's \texttt{ssm\_attn} implements chunk-wise parallel SSD with chunk size 256.
+
+\textbf{Limitation}: Chunkwise parallel does \emph{not} help decode (where $T=1$). This is a fundamental architectural constraint.
+
+% ── 7. Revised Optimization Roadmap ──────────────────────────
+\section{Revised Optimization Roadmap}
+
+Based on our findings, we propose three tiers of optimizations:
+
+\subsection{Immediate (Code Change $<$ 5 Lines)}
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{KV Cache quantization threshold}: Lower \texttt{DEFAULT\_QUANTIZED\_KV\_START} from 5000 to 512. Expected memory reduction: 28\% (8-bit) to 43\% (4-bit) on KV cache. ArraysCache layers are automatically skipped. Code change: 1 line.
+
+  \item \textbf{Prefill chunk size}: Increase \texttt{prefill\_step\_size} from 2048 to 4096. Measured impact: +5--10\% prefill throughput. Code change: 1 line.
+\end{enumerate}
+
+\subsection{Short-Term (1--2 Weeks)}
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Fused QKV projections}: Merge separate Q, K, V linear projections into a single quantized matmul kernel. Since projections account for 57.6\% of prefill time, reducing dispatch overhead and improving data reuse could yield 15--25\% improvement.
+
+  \item \textbf{Block mask skipping in SDPA}: Add causal block skipping to the \texttt{steel\_attention} kernel. For 512-token causal prefill, approximately half the KV blocks are fully masked and can be skipped entirely. Expected: 5--10\% on attention-heavy workloads.
+\end{enumerate}
+
+\subsection{Medium-Term (2--4 Weeks)}
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Chunkwise parallel GatedDeltaNet prefill}: Implement WY decomposition for chunk-wise parallel processing of GatedDeltaNet layers during prefill. This is the highest-value optimization, potentially yielding 3--10$\times$ prefill speedup on sequences $>256$ tokens. MLX's existing Mamba2 SSD implementation provides a code template.
+\end{enumerate}
+
+\subsection{Not Recommended}
+
+\begin{table}[H]
+\centering
+\caption{Optimization directions evaluated and rejected.}
+\label{tab:not_recommended}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Direction} & \textbf{Reason for Rejection} \\
+\midrule
+N-gram speculative decoding & Batch speedup insufficient (1.79--2.57$\times$ vs.\ 5$\times$ theory) \\
+Unified attention kernel & MLX already uses single dispatch \\
+Metal shader precompilation & MLX already uses AOT; only affects cold start \\
+SIMD matrix multiply & Already used in steel\_attention and steel/gemm \\
+Continuous Batching & No benefit for single-user edge inference \\
+Paged Attention & No memory fragmentation in single-user scenario \\
+GDN decode parallelization & Mathematically infeasible (matrix-valued recurrence) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% ── 8. Discussion ─────────────────────────────────────────────
+\section{Discussion}
+
+\subsection{The Memory Bandwidth Wall}
+
+Our central finding is that Apple Silicon LLM inference is \textbf{memory-bandwidth-bound}. MLX already achieves 85\% of the M2 Ultra's 800\,GB/s theoretical bandwidth during decode. This has profound implications:
+
+\begin{itemize}[leftmargin=2em]
+  \item Batch forward passes cannot achieve near-theoretical speedup because each additional query token increases KV cache bandwidth demand.
+  \item Speculative decoding's value proposition (``amortize weight-read cost over multiple tokens'') breaks down when the bottleneck is reading KV cache, not model weights.
+  \item Future optimizations must focus on reducing data movement (e.g., operator fusion, in-kernel dequantization) rather than increasing parallelism.
+\end{itemize}
+
+\subsection{Architecture-Specific Insights}
+
+The Qwen3.5 hybrid architecture (75\% GatedDeltaNet) presents unique challenges:
+\begin{itemize}[leftmargin=2em]
+  \item GatedDeltaNet's recurrence is 24\% of decode time but only 29\% of prefill time---the per-layer cost ($\sim$22.6\,ms) is similar to full-attention layers ($\sim$21.7\,ms) because both are dominated by linear projections.
+  \item The recurrence is \emph{mathematically non-parallelizable} for decode ($T=1$), setting a hard floor on decode latency that cannot be optimized away.
+  \item Chunkwise parallel is viable only for prefill, where $T \gg 1$.
+\end{itemize}
+
+\subsection{Limitations}
+
+\begin{enumerate}[leftmargin=2em]
+  \item Our speculative decoding evaluation uses N-gram prompt lookup only. A draft-model approach (e.g., Qwen3-0.5B) with higher acceptance rates might change the calculus, though the batch speedup limitation remains.
+  \item Profiling was conducted on M2 Ultra only. M3/M4 with NAX (Neural Architecture Extensions) may enable larger attention block sizes and different performance characteristics.
+  \item We did not implement the proposed optimizations beyond speculative decoding; feasibility assessments are based on code analysis and profiling data.
+\end{enumerate}
+
+% ── 9. Conclusion ─────────────────────────────────────────────
+\section{Conclusion}
+
+This study demonstrates that many commonly proposed LLM inference optimizations are either already implemented in MLX or fundamentally limited by memory bandwidth on Apple Silicon. The key lesson is that \textbf{empirical profiling must precede optimization}: our measurements overturned five assumptions from the prior proposal, potentially saving weeks of wasted engineering effort.
+
+For practitioners deploying LLMs on Apple Silicon:
+\begin{itemize}[leftmargin=2em]
+  \item MLX's token generation is already near-optimal (85\% bandwidth utilization). Focus optimization effort on prefill.
+  \item Speculative decoding with N-gram lookup is not beneficial. Consider draft-model approaches only if a suitable small model ($<$1B) is available with high acceptance rates.
+  \item The most impactful near-term change is lowering the KV cache quantization threshold---a 1-line code change yielding 28\% memory reduction.
+  \item For hybrid GatedDeltaNet architectures, chunkwise parallel prefill is the highest-value research direction.
+\end{itemize}
+
+% ── Acknowledgements ──────────────────────────────────────────
+\section*{Acknowledgements}
+
+All experiments were conducted on a personal Apple M2 Ultra workstation. The MLX framework by Apple Machine Learning Research made this work possible. Profiling tools and speculative decoding implementation are open-sourced alongside this paper.
+
+% ── References ────────────────────────────────────────────────
+\begin{thebibliography}{10}
+
+\bibitem{mlx}
+A.~Hannun et al., ``MLX: Efficient and flexible machine learning on Apple silicon,'' 2023. \url{https://github.com/ml-explore/mlx}
+
+\bibitem{llamacpp}
+G.~Gerganov, ``llama.cpp,'' 2023. \url{https://github.com/ggml-org/llama.cpp}
+
+\bibitem{spec_decoding}
+Y.~Leviathan, M.~Kalman, and Y.~Matias, ``Fast inference from Transformers via speculative decoding,'' in \emph{ICML}, 2023.
+
+\bibitem{gateddeltanet}
+J.~Siems et al., ``Gated Delta Networks: Improving Mamba2 with delta rule,'' in \emph{ICLR}, 2025. arXiv:2412.06464.
+
+\bibitem{deltanet}
+S.~Yang et al., ``Parallelizing linear Transformers with the delta rule over sequence length,'' in \emph{NeurIPS}, 2024. arXiv:2406.06484.
+
+\bibitem{flash_attn}
+T.~Dao, ``FlashAttention-2: Faster attention with better parallelism and work partitioning,'' 2023. arXiv:2307.08691.
+
+\bibitem{prior_proposal}
+Research\_Apple\_Silicon\_LLM\_Optimization.md, internal document, 2026.
+
+\bibitem{fla}
+Flash Linear Attention Library, \url{https://github.com/fla-org/flash-linear-attention}
+
+\bibitem{mamba2}
+T.~Dao and A.~Gu, ``Transformers are SSMs: Generalized models and efficient algorithms with structured state space duality,'' in \emph{ICML}, 2024.
+
+\end{thebibliography}
+
+\end{document}

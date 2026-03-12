@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Models (large files)
+*.mlpackage/
+*.gguf
+models/
+
+# Environment
+.env
+*.venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LaTeX intermediates
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.synctex.gz
+docs/*.fls
+docs/*.fdb_latexmk
+
+# IDE
+.vscode/
+.idea/
