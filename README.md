@@ -2,6 +2,10 @@
 
 **Why Speculative Decoding Fails and Where the Real Bottlenecks Lie**
 
+> **Work in Progress** — This research is ongoing. Results and conclusions may be updated as additional optimizations are implemented and validated.
+
+*By [AtomGradient](https://github.com/AtomGradient)*
+
 A systematic study of 9 optimization directions for LLM inference on Apple M2 Ultra using the MLX framework.
 
 ## Key Results
@@ -70,4 +74,4 @@ MLX 0.31.0 | mlx-vlm 0.3.12 | mlx-lm 0.30.7 | Python 3.11.13
 
 ---
 
-*March 2026*
+*AtomGradient &middot; March 2026*
