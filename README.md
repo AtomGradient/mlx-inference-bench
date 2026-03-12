@@ -65,8 +65,8 @@ python profile_prefill.py
 
 ## Publication
 
-- **Paper**: [docs/paper.pdf](docs/paper.pdf)
-- **Website**: [docs/index.html](docs/index.html)
+- **Paper**: [Download PDF](https://atomgradient.github.io/mlx-inference-bench/paper.pdf)
+- **Website**: [https://atomgradient.github.io/mlx-inference-bench/](https://atomgradient.github.io/mlx-inference-bench/)
 
 ## Software Versions
 
